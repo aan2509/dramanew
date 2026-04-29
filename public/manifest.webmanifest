@@ -1,0 +1,19 @@
+{
+  "name": "DramaNow",
+  "short_name": "DramaNow",
+  "description": "Streaming drama ringan dan cepat.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#08080a",
+  "theme_color": "#08080a",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
