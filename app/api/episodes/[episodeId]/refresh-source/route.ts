@@ -1,6 +1,9 @@
 import { unstable_noStore as noStore } from "next/cache";
 import { NextResponse } from "next/server";
-import { createSupabaseClient } from "@/lib/supabase";
+import {
+  createSupabaseClient,
+  createSupabaseWriteClient
+} from "@/lib/supabase";
 import {
   fetchFreshEpisodeSource,
   UpstreamSourceError
@@ -67,9 +70,15 @@ export async function POST(
       providerSeriesId,
       title: episodeRow.title
     });
+    const persistence = await persistFreshSource({
+      episodeId: episodeRow.id,
+      sourceUrl: freshSource.sourceUrl
+    });
 
     return NextResponse.json(
       {
+        database_update_error: persistence.error,
+        database_updated: persistence.updated,
         matchedBy: freshSource.matchedBy,
         source_m3u8_url: freshSource.sourceUrl
       },
@@ -101,6 +110,32 @@ export async function POST(
       }
     );
   }
+}
+
+async function persistFreshSource({
+  episodeId,
+  sourceUrl
+}: {
+  episodeId: string;
+  sourceUrl: string;
+}) {
+  const supabase = createSupabaseWriteClient();
+  const { error } = await supabase
+    .from("episodes")
+    .update({ source_m3u8_url: sourceUrl })
+    .eq("id", episodeId);
+
+  if (error) {
+    return {
+      error: error.message,
+      updated: false
+    };
+  }
+
+  return {
+    error: null,
+    updated: true
+  };
 }
 
 async function getSeriesFallback(

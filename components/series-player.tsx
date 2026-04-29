@@ -41,6 +41,32 @@ function positionSubtitleCues(track: TextTrack) {
   }
 }
 
+type RefreshSourcePayload = {
+  error?: unknown;
+  source_m3u8_url?: unknown;
+};
+
+async function fetchEpisodeFreshSource(episodeId: string) {
+  const response = await fetch(`/api/episodes/${episodeId}/refresh-source`, {
+    method: "POST"
+  });
+  const payload = (await response.json().catch(() => ({}))) as RefreshSourcePayload;
+  const freshSource =
+    typeof payload.source_m3u8_url === "string"
+      ? payload.source_m3u8_url.trim()
+      : "";
+
+  if (!response.ok || !freshSource) {
+    throw new Error(
+      typeof payload.error === "string"
+        ? payload.error
+        : "Gagal mengambil stream baru."
+    );
+  }
+
+  return freshSource;
+}
+
 export function SeriesPlayer({
   series,
   episodes,
@@ -60,6 +86,7 @@ export function SeriesPlayer({
     episodes[initialIndex]?.id ?? null
   );
   const refreshAttemptedRef = useRef<Set<string>>(new Set());
+  const prefetchAttemptedRef = useRef<Set<string>>(new Set());
   const [activeIndex, setActiveIndex] = useState(initialIndex);
   const [isPlaying, setIsPlaying] = useState(false);
   const [isSwitchingEpisode, setIsSwitchingEpisode] = useState(false);
@@ -91,6 +118,9 @@ export function SeriesPlayer({
     const decoded = getDecodedMediaSource(primary);
     return decoded ? [primary, decoded] : [primary];
   }, [active, sourceOverrides]);
+  const nextSource = next
+    ? (sourceOverrides[next.id] ?? next.source_m3u8_url)
+    : null;
   const transitionCoverStyle = series.cover_url
     ? { backgroundImage: `url("${series.cover_url.replace(/"/g, "%22")}")` }
     : undefined;
@@ -100,6 +130,29 @@ export function SeriesPlayer({
   const showControls = useCallback(() => {
     setControlsVisible(true);
   }, []);
+
+  const applySourceOverride = useCallback((episodeId: string, sourceUrl: string) => {
+    setSourceOverrides((current) => ({
+      ...current,
+      [episodeId]: sourceUrl
+    }));
+  }, []);
+
+  const prefetchFreshSource = useCallback(
+    async (episode?: Episode | null) => {
+      if (!episode?.id || prefetchAttemptedRef.current.has(episode.id)) return;
+
+      prefetchAttemptedRef.current.add(episode.id);
+
+      try {
+        const freshSource = await fetchEpisodeFreshSource(episode.id);
+        applySourceOverride(episode.id, freshSource);
+      } catch {
+        prefetchAttemptedRef.current.delete(episode.id);
+      }
+    },
+    [applySourceOverride]
+  );
 
   const requestFreshSource = useCallback(async () => {
     if (!active?.id) {
@@ -122,34 +175,14 @@ export function SeriesPlayer({
     setIsSwitchingEpisode(true);
 
     try {
-      const response = await fetch(`/api/episodes/${episodeId}/refresh-source`, {
-        method: "POST"
-      });
-      const payload = (await response.json().catch(() => ({}))) as {
-        error?: unknown;
-        source_m3u8_url?: unknown;
-      };
-      const freshSource =
-        typeof payload.source_m3u8_url === "string"
-          ? payload.source_m3u8_url.trim()
-          : "";
-
-      if (!response.ok || !freshSource) {
-        throw new Error(
-          typeof payload.error === "string"
-            ? payload.error
-            : "Gagal mengambil stream baru."
-        );
-      }
-
-      setSourceOverrides((current) => ({
-        ...current,
-        [episodeId]: freshSource
-      }));
+      const freshSource = await fetchEpisodeFreshSource(episodeId);
+      applySourceOverride(episodeId, freshSource);
 
       if (activeEpisodeIdRef.current === episodeId) {
         setSourceIndex(0);
       }
+
+      void prefetchFreshSource(episodes[activeIndex + 1]);
     } catch (loadError) {
       const fallbackMessage =
         loadError instanceof Error
@@ -165,7 +198,7 @@ export function SeriesPlayer({
         setRefreshingSource(false);
       }
     }
-  }, [active]);
+  }, [active, activeIndex, applySourceOverride, episodes, prefetchFreshSource]);
 
   const handleSourceFailure = useCallback(() => {
     if (sourceIndex < sourceCandidates.length - 1) {
@@ -398,7 +431,7 @@ export function SeriesPlayer({
         if (event.pointerType === "mouse") showControls();
       }}
     >
-      <HlsPreloader src={next?.source_m3u8_url} />
+      <HlsPreloader src={nextSource} />
 
       <video
         className="absolute inset-0 h-full w-full bg-black object-contain sm:object-cover"
