@@ -1,20 +1,37 @@
 type JsonRecord = Record<string, unknown>;
 
-export type FreshEpisodeSourceInput = {
+export type FreshEpisodeSourceTarget = {
   episodeId: string;
-  platform?: string | null;
-  providerSeriesId?: string | null;
-  providerBaseUrl?: string | null;
   episodeIndex?: number | null;
   episodeNumber?: number | null;
   title?: string | null;
+};
+
+export type FreshEpisodeSourceInput = FreshEpisodeSourceTarget & {
+  platform?: string | null;
+  providerSeriesId?: string | null;
+  providerBaseUrl?: string | null;
   lang?: string | null;
+};
+
+export type FreshEpisodeSourcesInput = {
+  platform?: string | null;
+  providerSeriesId?: string | null;
+  providerBaseUrl?: string | null;
+  lang?: string | null;
+  targets: FreshEpisodeSourceTarget[];
 };
 
 export type FreshEpisodeSource = {
   sourceUrl: string;
   matchedBy: string;
   upstreamUrl: string;
+  subtitleLanguage?: string | null;
+  subtitleUrl?: string | null;
+};
+
+export type FreshEpisodeSourceResult = FreshEpisodeSource & {
+  episodeId: string;
 };
 
 export class UpstreamSourceError extends Error {
@@ -35,10 +52,18 @@ type PlayableUrl = {
   score: number;
 };
 
+type SubtitleUrl = {
+  url: string;
+  language: string | null;
+  score: number;
+};
+
 type EpisodeCandidate = {
   sourceUrl: string;
   score: number;
   matchedBy: string;
+  subtitleLanguage: string | null;
+  subtitleUrl: string | null;
 };
 
 const defaultProviderBaseUrl = "https://api.dracinku.site";
@@ -50,6 +75,38 @@ const episodeKeyPattern =
 export async function fetchFreshEpisodeSource(
   input: FreshEpisodeSourceInput
 ): Promise<FreshEpisodeSource> {
+  const [source] = await fetchFreshEpisodeSources({
+    lang: input.lang,
+    platform: input.platform,
+    providerBaseUrl: input.providerBaseUrl,
+    providerSeriesId: input.providerSeriesId,
+    targets: [input]
+  });
+
+  if (!source) {
+    throw new UpstreamSourceError(
+      "URL stream fresh tidak ditemukan dari upstream.",
+      404,
+      "UPSTREAM_SOURCE_NOT_FOUND"
+    );
+  }
+
+  return {
+    matchedBy: source.matchedBy,
+    sourceUrl: source.sourceUrl,
+    subtitleLanguage: source.subtitleLanguage,
+    subtitleUrl: source.subtitleUrl,
+    upstreamUrl: source.upstreamUrl
+  };
+}
+
+export async function fetchFreshEpisodeSources({
+  lang,
+  platform: rawPlatform,
+  providerBaseUrl,
+  providerSeriesId: rawProviderSeriesId,
+  targets
+}: FreshEpisodeSourcesInput): Promise<FreshEpisodeSourceResult[]> {
   const apiKey = getUpstreamApiKey();
   if (!apiKey) {
     throw new UpstreamSourceError(
@@ -59,8 +116,8 @@ export async function fetchFreshEpisodeSource(
     );
   }
 
-  const platform = input.platform?.trim();
-  const providerSeriesId = input.providerSeriesId?.trim();
+  const platform = rawPlatform?.trim();
+  const providerSeriesId = rawProviderSeriesId?.trim();
 
   if (!platform || !providerSeriesId) {
     throw new UpstreamSourceError(
@@ -70,9 +127,11 @@ export async function fetchFreshEpisodeSource(
     );
   }
 
+  if (!targets.length) return [];
+
   const upstreamUrls = buildSeriesUrls({
-    baseUrl: input.providerBaseUrl,
-    lang: input.lang,
+    baseUrl: providerBaseUrl,
+    lang,
     platform,
     providerSeriesId
   });
@@ -98,9 +157,28 @@ export async function fetchFreshEpisodeSource(
     }
 
     const payload = (await response.json()) as unknown;
-    const candidate = findEpisodeSource(payload, input);
+    const results = targets.flatMap((target) => {
+      const candidate = findEpisodeSource(payload, {
+        ...target,
+        lang,
+        platform,
+        providerBaseUrl,
+        providerSeriesId
+      });
 
-    if (!candidate) {
+      if (!candidate) return [];
+
+      return {
+        episodeId: target.episodeId,
+        matchedBy: candidate.matchedBy,
+        sourceUrl: candidate.sourceUrl,
+        subtitleLanguage: candidate.subtitleLanguage,
+        subtitleUrl: candidate.subtitleUrl,
+        upstreamUrl
+      };
+    });
+
+    if (!results.length) {
       lastError = new UpstreamSourceError(
         "URL stream fresh tidak ditemukan dari upstream.",
         404,
@@ -109,11 +187,7 @@ export async function fetchFreshEpisodeSource(
       continue;
     }
 
-    return {
-      sourceUrl: candidate.sourceUrl,
-      matchedBy: candidate.matchedBy,
-      upstreamUrl
-    };
+    return results;
   }
 
   throw (
@@ -203,10 +277,16 @@ function walkEpisodeCandidates(
     const score = scoreEpisodeObject(value, target, arrayIndex);
     if (score > 0) {
       const bestUrl = urls.sort((a, b) => b.score - a.score)[0];
+      const bestSubtitle = chooseSubtitleUrl(
+        collectSubtitleUrls(value),
+        target.lang
+      );
       candidates.push({
         sourceUrl: bestUrl.url,
         score: score + bestUrl.score,
-        matchedBy: buildMatchReason(value, target, arrayIndex, bestUrl.key)
+        matchedBy: buildMatchReason(value, target, arrayIndex, bestUrl.key),
+        subtitleLanguage: bestSubtitle?.language ?? null,
+        subtitleUrl: bestSubtitle?.url ?? null
       });
     }
   }
@@ -274,6 +354,94 @@ function scoreMediaUrl(url: string, key: string) {
   if (lowerUrl.includes("/aliplay/video/")) score += 10;
   if (lowerUrl.includes(".mp4")) score += 8;
   if (lowerUrl.includes("expires=")) score += 3;
+
+  return score;
+}
+
+function collectSubtitleUrls(value: unknown, depth = 0): SubtitleUrl[] {
+  if (depth >= 4) return [];
+
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => collectSubtitleUrls(item, depth + 1));
+  }
+
+  if (!isRecord(value)) return [];
+
+  const directSubtitle =
+    typeof value.subtitle === "string"
+      ? normalizeSubtitleUrl(value.subtitle)
+      : null;
+  const language = normalizeSubtitleLanguage(value.language ?? value.lang);
+  const direct = directSubtitle
+    ? [
+        {
+          language,
+          score: scoreSubtitleUrl(directSubtitle, language),
+          url: directSubtitle
+        }
+      ]
+    : [];
+
+  const nested = Object.entries(value).flatMap(([key, child]) => {
+    if (typeof child === "string") {
+      const url = normalizeSubtitleUrl(child);
+      if (!url) return [];
+
+      return {
+        language: subtitleKeyPattern.test(key) ? language : null,
+        score: scoreSubtitleUrl(url, language),
+        url
+      };
+    }
+
+    return collectSubtitleUrls(child, depth + 1);
+  });
+
+  return [...direct, ...nested];
+}
+
+function normalizeSubtitleUrl(value: string) {
+  const trimmed = value.trim();
+  if (!/^https?:\/\//i.test(trimmed)) return null;
+
+  const lower = trimmed.toLowerCase();
+  if (
+    !lower.includes("subtitle") &&
+    !lower.includes("caption") &&
+    !lower.includes(".vtt") &&
+    !lower.includes(".srt")
+  ) {
+    return null;
+  }
+
+  return trimmed;
+}
+
+const subtitleKeyPattern = /(caption|subtitle|subtitles|vtt|srt)/i;
+
+function normalizeSubtitleLanguage(value: unknown) {
+  if (typeof value !== "string") return null;
+  return value.trim().toLowerCase().split("_")[0] || null;
+}
+
+function chooseSubtitleUrl(subtitles: SubtitleUrl[], targetLang?: string | null) {
+  if (!subtitles.length) return null;
+
+  const language = normalizeSubtitleLanguage(targetLang) ?? "id";
+  return subtitles.sort((a, b) => {
+    const aScore = a.score + (a.language === language ? 50 : 0);
+    const bScore = b.score + (b.language === language ? 50 : 0);
+    return bScore - aScore;
+  })[0];
+}
+
+function scoreSubtitleUrl(url: string, language: string | null) {
+  const lower = url.toLowerCase();
+  let score = language === "id" ? 30 : 0;
+
+  if (lower.includes("/ind") || lower.includes("lang=id")) score += 20;
+  if (lower.includes(".vtt")) score += 12;
+  if (lower.includes("subtitle") || lower.includes("caption")) score += 10;
 
   return score;
 }

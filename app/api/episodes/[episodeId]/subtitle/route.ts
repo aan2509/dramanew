@@ -1,5 +1,5 @@
 import { unstable_noStore as noStore } from "next/cache";
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import {
   createSupabaseClient,
   createSupabaseWriteClient
@@ -18,6 +18,8 @@ type EpisodeRow = {
   episode_number: number | null;
   title: string | null;
   lang?: string | null;
+  subtitle_language: string | null;
+  subtitle_url: string | null;
 };
 
 type SeriesRow = {
@@ -30,20 +32,21 @@ type ProviderRow = {
   base_url: string | null;
 };
 
-export async function POST(
-  _request: Request,
+export async function GET(
+  request: NextRequest,
   context: { params: Promise<{ episodeId: string }> }
 ) {
   noStore();
 
   const { episodeId } = await context.params;
+  const requestedLang = request.nextUrl.searchParams.get("lang") || "id";
   const supabase = createSupabaseClient();
 
   try {
     const { data: episode, error: episodeError } = await supabase
       .from("episodes")
       .select(
-        "id, series_id, platform, provider_series_id, episode_index, episode_number, title, lang"
+        "id, series_id, platform, provider_series_id, episode_index, episode_number, title, lang, subtitle_url, subtitle_language"
       )
       .eq("id", episodeId)
       .single();
@@ -51,6 +54,11 @@ export async function POST(
     if (episodeError) throw episodeError;
 
     const episodeRow = episode as EpisodeRow;
+    const existingSubtitle = await tryFetchSubtitle(episodeRow.subtitle_url);
+    if (existingSubtitle) {
+      return subtitleResponse(existingSubtitle);
+    }
+
     const series = await getSeriesFallback(supabase, episodeRow.series_id);
     const platform = episodeRow.platform ?? series?.platform;
     const providerSeriesId =
@@ -59,47 +67,49 @@ export async function POST(
       platform,
       providerId: series?.provider_id
     });
-
     const freshSource = await fetchFreshEpisodeSource({
       episodeId: episodeRow.id,
       episodeIndex: episodeRow.episode_index,
       episodeNumber: episodeRow.episode_number,
-      lang: episodeRow.lang,
+      lang: episodeRow.lang ?? requestedLang,
       platform,
       providerBaseUrl,
       providerSeriesId,
       title: episodeRow.title
     });
-    const persistence = await persistFreshSource({
+
+    if (!freshSource.subtitleUrl) {
+      throw new UpstreamSourceError(
+        "Subtitle Indonesia tidak ditemukan dari upstream.",
+        404,
+        "UPSTREAM_SUBTITLE_NOT_FOUND"
+      );
+    }
+
+    const freshSubtitle = await tryFetchSubtitle(freshSource.subtitleUrl);
+    if (!freshSubtitle) {
+      throw new UpstreamSourceError(
+        "Subtitle Indonesia dari upstream belum bisa dimuat.",
+        404,
+        "UPSTREAM_SUBTITLE_UNAVAILABLE"
+      );
+    }
+
+    await persistFreshSubtitle({
       episodeId: episodeRow.id,
-      sourceUrl: freshSource.sourceUrl,
-      subtitleLanguage: freshSource.subtitleLanguage,
+      subtitleLanguage: freshSource.subtitleLanguage || requestedLang,
       subtitleUrl: freshSource.subtitleUrl
     });
 
-    return NextResponse.json(
-      {
-        database_update_error: persistence.error,
-        database_updated: persistence.updated,
-        matchedBy: freshSource.matchedBy,
-        source_m3u8_url: freshSource.sourceUrl,
-        subtitle_language: freshSource.subtitleLanguage,
-        subtitle_url: freshSource.subtitleUrl
-      },
-      {
-        headers: {
-          "Cache-Control": "no-store"
-        }
-      }
-    );
+    return subtitleResponse(freshSubtitle);
   } catch (error) {
     const status = error instanceof UpstreamSourceError ? error.status : 500;
     const code =
       error instanceof UpstreamSourceError
         ? error.code
-        : "REFRESH_SOURCE_FAILED";
+        : "SUBTITLE_LOAD_FAILED";
     const message =
-      error instanceof Error ? error.message : "Gagal refresh URL stream.";
+      error instanceof Error ? error.message : "Gagal memuat subtitle.";
 
     return NextResponse.json(
       {
@@ -116,47 +126,54 @@ export async function POST(
   }
 }
 
-async function persistFreshSource({
+async function tryFetchSubtitle(url?: string | null) {
+  if (!url) return null;
+
+  const response = await fetch(url, {
+    cache: "no-store",
+    headers: {
+      accept: "text/vtt,text/plain,*/*"
+    }
+  }).catch(() => null);
+
+  if (!response?.ok) return null;
+
+  const text = await response.text();
+  if (!looksLikeVtt(text)) return null;
+  return text;
+}
+
+function looksLikeVtt(text: string) {
+  const trimmed = text.trimStart();
+  return trimmed.startsWith("WEBVTT") || trimmed.includes("-->");
+}
+
+function subtitleResponse(text: string) {
+  return new NextResponse(text, {
+    headers: {
+      "Cache-Control": "no-store",
+      "Content-Type": "text/vtt; charset=utf-8"
+    }
+  });
+}
+
+async function persistFreshSubtitle({
   episodeId,
-  sourceUrl,
   subtitleLanguage,
   subtitleUrl
 }: {
   episodeId: string;
-  sourceUrl: string;
-  subtitleLanguage?: string | null;
-  subtitleUrl?: string | null;
+  subtitleLanguage: string;
+  subtitleUrl: string;
 }) {
   const supabase = createSupabaseWriteClient();
-  const values: {
-    source_m3u8_url: string;
-    subtitle_language?: string;
-    subtitle_url?: string;
-  } = {
-    source_m3u8_url: sourceUrl
-  };
-
-  if (subtitleUrl) {
-    values.subtitle_url = subtitleUrl;
-    values.subtitle_language = subtitleLanguage || "id";
-  }
-
-  const { error } = await supabase
+  await supabase
     .from("episodes")
-    .update(values)
+    .update({
+      subtitle_language: subtitleLanguage,
+      subtitle_url: subtitleUrl
+    })
     .eq("id", episodeId);
-
-  if (error) {
-    return {
-      error: error.message,
-      updated: false
-    };
-  }
-
-  return {
-    error: null,
-    updated: true
-  };
 }
 
 async function getSeriesFallback(

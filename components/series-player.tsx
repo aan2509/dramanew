@@ -27,24 +27,26 @@ function formatTime(seconds: number) {
   return `${String(minutes).padStart(2, "0")}:${String(rest).padStart(2, "0")}`;
 }
 
-function positionSubtitleCues(track: TextTrack) {
-  const cues = [...Array.from(track.cues ?? []), ...Array.from(track.activeCues ?? [])];
-
-  for (const cue of cues) {
-    if (!("line" in cue)) continue;
-    const vttCue = cue as VTTCue;
-    vttCue.snapToLines = false;
-    vttCue.line = 74;
-    vttCue.position = 50;
-    vttCue.size = 88;
-    vttCue.align = "center";
-  }
-}
-
 type RefreshSourcePayload = {
   error?: unknown;
   source_m3u8_url?: unknown;
 };
+
+type BatchRefreshSourcePayload = {
+  refreshed?: Array<{
+    episode_id?: unknown;
+    source_m3u8_url?: unknown;
+  }>;
+};
+
+type SubtitleCue = {
+  end: number;
+  start: number;
+  text: string;
+};
+
+const sourcePrefetchLookAhead = 16;
+const sourcePrefetchDelayMs = 900;
 
 async function fetchEpisodeFreshSource(episodeId: string) {
   const response = await fetch(`/api/episodes/${episodeId}/refresh-source`, {
@@ -67,6 +69,81 @@ async function fetchEpisodeFreshSource(episodeId: string) {
   return freshSource;
 }
 
+async function fetchEpisodeFreshSources(episodeIds: string[]) {
+  if (!episodeIds.length) return new Map<string, string>();
+
+  const response = await fetch("/api/episodes/refresh-sources", {
+    body: JSON.stringify({ episodeIds }),
+    headers: {
+      "Content-Type": "application/json"
+    },
+    method: "POST"
+  });
+  const payload = (await response.json().catch(() => ({}))) as BatchRefreshSourcePayload;
+
+  if (!response.ok) return new Map<string, string>();
+
+  return new Map(
+    (payload.refreshed ?? []).flatMap((item) => {
+      const episodeId =
+        typeof item.episode_id === "string" ? item.episode_id.trim() : "";
+      const sourceUrl =
+        typeof item.source_m3u8_url === "string"
+          ? item.source_m3u8_url.trim()
+          : "";
+
+      return episodeId && sourceUrl ? [[episodeId, sourceUrl] as const] : [];
+    })
+  );
+}
+
+function parseVttTimestamp(value: string) {
+  const parts = value.trim().replace(",", ".").split(":");
+  if (parts.length < 2) return null;
+
+  const seconds = Number(parts.pop());
+  const minutes = Number(parts.pop());
+  const hours = parts.length ? Number(parts.pop()) : 0;
+
+  if (![hours, minutes, seconds].every(Number.isFinite)) return null;
+  return hours * 3600 + minutes * 60 + seconds;
+}
+
+function parseVtt(text: string): SubtitleCue[] {
+  const blocks = text
+    .replace(/^\uFEFF/, "")
+    .split(/\r?\n\r?\n/)
+    .map((block) => block.trim())
+    .filter(Boolean);
+
+  return blocks.flatMap((block) => {
+    const lines = block.split(/\r?\n/);
+    const timingIndex = lines.findIndex((line) => line.includes("-->"));
+    if (timingIndex === -1) return [];
+
+    const [startText, endText] = lines[timingIndex].split("-->");
+    const start = parseVttTimestamp(startText);
+    const end = parseVttTimestamp(endText.trim().split(/\s+/)[0]);
+    const cueText = lines
+      .slice(timingIndex + 1)
+      .join("\n")
+      .replace(/<[^>]+>/g, "")
+      .replace(/&nbsp;/g, " ")
+      .replace(/&amp;/g, "&")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .trim();
+
+    if (start === null || end === null || !cueText) return [];
+
+    return {
+      end,
+      start,
+      text: cueText
+    };
+  });
+}
+
 export function SeriesPlayer({
   series,
   episodes,
@@ -87,6 +164,7 @@ export function SeriesPlayer({
   );
   const refreshAttemptedRef = useRef<Set<string>>(new Set());
   const prefetchAttemptedRef = useRef<Set<string>>(new Set());
+  const prefetchInFlightRef = useRef<Set<string>>(new Set());
   const [activeIndex, setActiveIndex] = useState(initialIndex);
   const [isPlaying, setIsPlaying] = useState(false);
   const [isSwitchingEpisode, setIsSwitchingEpisode] = useState(false);
@@ -102,6 +180,8 @@ export function SeriesPlayer({
   const [refreshError, setRefreshError] = useState<string | null>(null);
   const [userStartedPlayback, setUserStartedPlayback] = useState(false);
   const [subtitlesEnabled, setSubtitlesEnabled] = useState(true);
+  const [subtitleCues, setSubtitleCues] = useState<SubtitleCue[]>([]);
+  const [subtitleUnavailable, setSubtitleUnavailable] = useState<Record<string, boolean>>({});
 
   const active = episodes[activeIndex];
   const next = activeIndex < episodes.length - 1 ? episodes[activeIndex + 1] : null;
@@ -124,31 +204,74 @@ export function SeriesPlayer({
   const transitionCoverStyle = series.cover_url
     ? { backgroundImage: `url("${series.cover_url.replace(/"/g, "%22")}")` }
     : undefined;
-  const hasSubtitle = Boolean(active?.subtitle_url);
   const subtitleLanguage = active?.subtitle_language?.split("_")[0] || "id";
+  const mayHaveSubtitle = Boolean(
+    active?.subtitle_url || active?.platform === "dramadash"
+  );
+  const hasSubtitle = Boolean(
+    mayHaveSubtitle && active && !subtitleUnavailable[active.id]
+  );
+  const activeSubtitleText = useMemo(() => {
+    if (!subtitlesEnabled || !subtitleCues.length) return "";
+
+    return subtitleCues
+      .filter((cue) => currentTime >= cue.start && currentTime <= cue.end)
+      .map((cue) => cue.text)
+      .join("\n");
+  }, [currentTime, subtitleCues, subtitlesEnabled]);
 
   const showControls = useCallback(() => {
     setControlsVisible(true);
   }, []);
 
-  const applySourceOverride = useCallback((episodeId: string, sourceUrl: string) => {
-    setSourceOverrides((current) => ({
-      ...current,
-      [episodeId]: sourceUrl
-    }));
-  }, []);
+  const applySourceOverride = useCallback(
+    (episodeId: string, sourceUrl: string) => {
+      setSourceOverrides((current) => ({
+        ...current,
+        [episodeId]: sourceUrl
+      }));
+    },
+    []
+  );
 
-  const prefetchFreshSource = useCallback(
-    async (episode?: Episode | null) => {
-      if (!episode?.id || prefetchAttemptedRef.current.has(episode.id)) return;
+  const prefetchFreshSources = useCallback(
+    async (items: Episode[]) => {
+      const targets = items
+        .filter(
+          (episode) =>
+            episode.id &&
+            !prefetchAttemptedRef.current.has(episode.id) &&
+            !prefetchInFlightRef.current.has(episode.id)
+        )
+        .slice(0, sourcePrefetchLookAhead);
 
-      prefetchAttemptedRef.current.add(episode.id);
+      if (!targets.length) return;
+
+      const episodeIds = targets.map((episode) => episode.id);
+      for (const episodeId of episodeIds) {
+        prefetchAttemptedRef.current.add(episodeId);
+        prefetchInFlightRef.current.add(episodeId);
+      }
 
       try {
-        const freshSource = await fetchEpisodeFreshSource(episode.id);
-        applySourceOverride(episode.id, freshSource);
+        const refreshed = await fetchEpisodeFreshSources(episodeIds);
+        for (const [episodeId, sourceUrl] of refreshed) {
+          applySourceOverride(episodeId, sourceUrl);
+        }
+
+        for (const episodeId of episodeIds) {
+          if (!refreshed.has(episodeId)) {
+            prefetchAttemptedRef.current.delete(episodeId);
+          }
+        }
       } catch {
-        prefetchAttemptedRef.current.delete(episode.id);
+        for (const episodeId of episodeIds) {
+          prefetchAttemptedRef.current.delete(episodeId);
+        }
+      } finally {
+        for (const episodeId of episodeIds) {
+          prefetchInFlightRef.current.delete(episodeId);
+        }
       }
     },
     [applySourceOverride]
@@ -182,7 +305,9 @@ export function SeriesPlayer({
         setSourceIndex(0);
       }
 
-      void prefetchFreshSource(episodes[activeIndex + 1]);
+      void prefetchFreshSources(
+        episodes.slice(activeIndex + 1, activeIndex + 1 + sourcePrefetchLookAhead)
+      );
     } catch (loadError) {
       const fallbackMessage =
         loadError instanceof Error
@@ -198,7 +323,7 @@ export function SeriesPlayer({
         setRefreshingSource(false);
       }
     }
-  }, [active, activeIndex, applySourceOverride, episodes, prefetchFreshSource]);
+  }, [active, activeIndex, applySourceOverride, episodes, prefetchFreshSources]);
 
   const handleSourceFailure = useCallback(() => {
     if (sourceIndex < sourceCandidates.length - 1) {
@@ -341,30 +466,60 @@ export function SeriesPlayer({
   ]);
 
   useEffect(() => {
-    const video = videoRef.current;
-    if (!video) return;
+    if (!active?.id) return;
 
-    const cleanup: Array<() => void> = [];
+    const timer = window.setTimeout(() => {
+      void prefetchFreshSources(
+        episodes.slice(activeIndex + 1, activeIndex + 1 + sourcePrefetchLookAhead)
+      );
+    }, sourcePrefetchDelayMs);
 
-    for (const track of Array.from(video.textTracks)) {
-      track.mode = subtitlesEnabled ? "showing" : "disabled";
-      positionSubtitleCues(track);
+    return () => window.clearTimeout(timer);
+  }, [active?.id, activeIndex, episodes, prefetchFreshSources]);
 
-      const handleCueChange = () => positionSubtitleCues(track);
-      track.addEventListener("cuechange", handleCueChange);
-      cleanup.push(() => track.removeEventListener("cuechange", handleCueChange));
+  useEffect(() => {
+    if (!active?.id || !mayHaveSubtitle) {
+      queueMicrotask(() => setSubtitleCues([]));
+      return;
     }
 
-    const placementTimer = window.setTimeout(() => {
-      for (const track of Array.from(video.textTracks)) positionSubtitleCues(track);
-    }, 300);
+    const controller = new AbortController();
+    queueMicrotask(() => {
+      setSubtitleCues([]);
+      setSubtitleUnavailable((current) => ({
+        ...current,
+        [active.id]: false
+      }));
+    });
 
-    cleanup.push(() => window.clearTimeout(placementTimer));
+    fetch(`/api/episodes/${active.id}/subtitle?lang=${subtitleLanguage}`, {
+      signal: controller.signal
+    })
+      .then(async (response) => {
+        if (!response.ok) throw new Error("Subtitle unavailable");
+        return response.text();
+      })
+      .then((text) => {
+        const cues = parseVtt(text);
+        setSubtitleCues(cues);
+        if (!cues.length) {
+          setSubtitleUnavailable((current) => ({
+            ...current,
+            [active.id]: true
+          }));
+        }
+      })
+      .catch((error) => {
+        if (error instanceof DOMException && error.name === "AbortError") return;
+        setSubtitleCues([]);
+        setSubtitleUnavailable((current) => ({
+          ...current,
+          [active.id]: true
+        }));
+      });
 
-    return () => {
-      for (const remove of cleanup) remove();
-    };
-  }, [active?.id, subtitlesEnabled]);
+    return () => controller.abort();
+  }, [active?.id, mayHaveSubtitle, subtitleLanguage]);
 
   if (!episodes.length || !active) {
     return (
@@ -404,6 +559,9 @@ export function SeriesPlayer({
   }
 
   function switchEpisode(index: number) {
+    void prefetchFreshSources(
+      episodes.slice(index, index + sourcePrefetchLookAhead)
+    );
     setSourceIndex(0);
     setRefreshError(null);
     setIsSwitchingEpisode(true);
@@ -442,18 +600,7 @@ export function SeriesPlayer({
         ref={videoRef}
         title={`${series.title} ${episodeLabel}`}
         onClick={handleVideoTap}
-      >
-        {subtitlesEnabled && active.subtitle_url ? (
-          <track
-            default
-            key={`${active.id}-subtitle`}
-            kind="subtitles"
-            label="Indonesia"
-            src={active.subtitle_url}
-            srcLang={subtitleLanguage}
-          />
-        ) : null}
-      </video>
+      />
 
       <div
         aria-hidden="true"
@@ -473,6 +620,14 @@ export function SeriesPlayer({
           overlayVisible ? "opacity-100" : "opacity-0"
         }`}
       />
+
+      {activeSubtitleText ? (
+        <div className="pointer-events-none absolute inset-x-3 bottom-28 z-10 flex justify-center px-8 sm:bottom-32">
+          <p className="max-w-3xl whitespace-pre-line rounded bg-black/70 px-3 py-2 text-center text-base font-semibold leading-snug text-white shadow-lg sm:text-xl">
+            {activeSubtitleText}
+          </p>
+        </div>
+      ) : null}
 
       <header
         className={`absolute inset-x-0 top-0 z-10 flex items-center gap-3 px-4 pb-4 pt-[max(1rem,env(safe-area-inset-top))] transition-opacity duration-300 ${
@@ -543,6 +698,12 @@ export function SeriesPlayer({
           label="Episode"
           onClick={() => {
             showControls();
+            void prefetchFreshSources(
+              episodes.slice(
+                activeIndex + 1,
+                activeIndex + 1 + sourcePrefetchLookAhead
+              )
+            );
             setShowEpisodes(true);
           }}
         />
