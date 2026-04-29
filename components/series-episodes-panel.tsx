@@ -4,7 +4,6 @@ import Link from "next/link";
 import { Loader2, Play } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { EpisodeList } from "@/components/episode-list";
-import { HlsPreloader } from "@/components/hls-preloader";
 import type { Episode } from "@/lib/types";
 
 export function SeriesEpisodesPanel({
@@ -69,7 +68,6 @@ export function SeriesEpisodesPanel({
 
   return (
     <section className="mt-8">
-      <HlsPreloader src={firstEpisode?.source_m3u8_url} />
       <div className="mb-3">
         <h2 className="text-2xl font-black">Daftar Episode</h2>
       </div>

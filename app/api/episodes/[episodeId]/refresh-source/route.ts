@@ -31,12 +31,18 @@ type ProviderRow = {
 };
 
 export async function POST(
-  _request: Request,
+  request: Request,
   context: { params: Promise<{ episodeId: string }> }
 ) {
   noStore();
 
   const { episodeId } = await context.params;
+  const payload = (await request.json().catch(() => ({}))) as {
+    force?: unknown;
+    persist?: unknown;
+  };
+  const forceFresh = payload.force === true;
+  const shouldPersist = payload.persist === true;
   const supabase = createSupabaseClient();
 
   try {
@@ -64,18 +70,24 @@ export async function POST(
       episodeId: episodeRow.id,
       episodeIndex: episodeRow.episode_index,
       episodeNumber: episodeRow.episode_number,
+      forceFresh,
       lang: episodeRow.lang,
       platform,
       providerBaseUrl,
       providerSeriesId,
       title: episodeRow.title
     });
-    const persistence = await persistFreshSource({
-      episodeId: episodeRow.id,
-      sourceUrl: freshSource.sourceUrl,
-      subtitleLanguage: freshSource.subtitleLanguage,
-      subtitleUrl: freshSource.subtitleUrl
-    });
+    const persistence = shouldPersist
+      ? await persistFreshSource({
+          episodeId: episodeRow.id,
+          sourceUrl: freshSource.sourceUrl,
+          subtitleLanguage: freshSource.subtitleLanguage,
+          subtitleUrl: freshSource.subtitleUrl
+        })
+      : {
+          error: null,
+          updated: false
+        };
 
     return NextResponse.json(
       {

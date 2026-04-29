@@ -45,12 +45,14 @@ export async function POST(request: Request) {
 
   const payload = (await request.json().catch(() => ({}))) as {
     episodeIds?: unknown;
+    persist?: unknown;
   };
   const episodeIds = Array.isArray(payload.episodeIds)
     ? [...new Set(payload.episodeIds)]
         .filter((id): id is string => typeof id === "string" && Boolean(id.trim()))
         .slice(0, maxBatchSize)
     : [];
+  const shouldPersist = payload.persist === true;
 
   if (!episodeIds.length) {
     return NextResponse.json(
@@ -125,7 +127,17 @@ export async function POST(request: Request) {
         providerSeriesId: group.providerSeriesId,
         targets: group.targets
       });
-      const persisted = await persistFreshSources(sources);
+      const persisted = shouldPersist
+        ? await persistFreshSources(sources)
+        : sources.map((source) => ({
+            database_update_error: null,
+            database_updated: false,
+            episode_id: source.episodeId,
+            matchedBy: source.matchedBy,
+            source_m3u8_url: source.sourceUrl,
+            subtitle_language: source.subtitleLanguage,
+            subtitle_url: source.subtitleUrl
+          }));
       refreshed.push(...persisted);
 
       const foundIds = new Set(sources.map((source) => source.episodeId));

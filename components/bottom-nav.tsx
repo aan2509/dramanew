@@ -13,6 +13,8 @@ const items = [
 export function BottomNav() {
   const pathname = usePathname();
 
+  if (pathname.startsWith("/admin")) return null;
+
   return (
     <nav className="fixed inset-x-0 bottom-0 z-50 border-t border-white/10 bg-[#08080a]/90 backdrop-blur-xl">
       <div className="mx-auto grid h-16 max-w-2xl grid-cols-3 px-4 pb-[env(safe-area-inset-bottom)]">

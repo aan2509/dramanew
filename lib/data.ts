@@ -192,8 +192,8 @@ export async function getSeriesEpisodes(lookup: string | EpisodeLookup) {
     .select(
       "id, series_id, platform, provider_series_id, title, episode_index, episode_number, source_m3u8_url, subtitle_url, subtitle_language"
     )
-    .not("source_m3u8_url", "is", null)
     .order("episode_number", { ascending: true })
+    .order("episode_index", { ascending: true })
     .range(0, 299);
 
   if (platform && providerSeriesId) {

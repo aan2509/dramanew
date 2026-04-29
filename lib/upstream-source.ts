@@ -8,6 +8,7 @@ export type FreshEpisodeSourceTarget = {
 };
 
 export type FreshEpisodeSourceInput = FreshEpisodeSourceTarget & {
+  forceFresh?: boolean;
   platform?: string | null;
   providerSeriesId?: string | null;
   providerBaseUrl?: string | null;
@@ -15,6 +16,7 @@ export type FreshEpisodeSourceInput = FreshEpisodeSourceTarget & {
 };
 
 export type FreshEpisodeSourcesInput = {
+  forceFresh?: boolean;
   platform?: string | null;
   providerSeriesId?: string | null;
   providerBaseUrl?: string | null;
@@ -67,15 +69,24 @@ type EpisodeCandidate = {
 };
 
 const defaultProviderBaseUrl = "https://api.dracinku.site";
+const providerSeriesCacheTtlMs = 90_000;
 const mediaKeyPattern =
   /(aliplay|cdn|file|hls|link|m3u8|mp4|play|source|src|stream|url|video)/i;
 const episodeKeyPattern =
   /(chapter|episode|ep|index|number|no|num|order|seq|sort|title)/i;
+const providerSeriesCache = new Map<
+  string,
+  {
+    expiresAt: number;
+    payload: unknown;
+  }
+>();
 
 export async function fetchFreshEpisodeSource(
   input: FreshEpisodeSourceInput
 ): Promise<FreshEpisodeSource> {
   const [source] = await fetchFreshEpisodeSources({
+    forceFresh: input.forceFresh,
     lang: input.lang,
     platform: input.platform,
     providerBaseUrl: input.providerBaseUrl,
@@ -101,6 +112,7 @@ export async function fetchFreshEpisodeSource(
 }
 
 export async function fetchFreshEpisodeSources({
+  forceFresh = false,
   lang,
   platform: rawPlatform,
   providerBaseUrl,
@@ -139,27 +151,28 @@ export async function fetchFreshEpisodeSources({
   let lastError: UpstreamSourceError | null = null;
 
   for (const upstreamUrl of upstreamUrls) {
-    const response = await fetch(upstreamUrl, {
-      cache: "no-store",
-      headers: {
-        accept: "application/json",
-        "x-api-key": apiKey
-      }
-    });
+    let payload: unknown;
 
-    if (!response.ok) {
-      lastError = new UpstreamSourceError(
-        `Upstream gagal dimuat (${response.status}).`,
-        502,
-        "UPSTREAM_REQUEST_FAILED"
-      );
+    try {
+      payload = await fetchProviderSeriesPayload(upstreamUrl, apiKey, forceFresh);
+    } catch (error) {
+      lastError =
+        error instanceof UpstreamSourceError
+          ? error
+          : new UpstreamSourceError(
+              error instanceof Error
+                ? error.message
+                : "Upstream gagal dimuat.",
+              502,
+              "UPSTREAM_REQUEST_FAILED"
+            );
       continue;
     }
 
-    const payload = (await response.json()) as unknown;
     const results = targets.flatMap((target) => {
       const candidate = findEpisodeSource(payload, {
         ...target,
+        forceFresh,
         lang,
         platform,
         providerBaseUrl,
@@ -200,6 +213,43 @@ export async function fetchFreshEpisodeSources({
   );
 }
 
+async function fetchProviderSeriesPayload(
+  upstreamUrl: string,
+  apiKey: string,
+  forceFresh: boolean
+) {
+  const now = Date.now();
+  const cached = providerSeriesCache.get(upstreamUrl);
+
+  if (!forceFresh && cached && cached.expiresAt > now) {
+    return cached.payload;
+  }
+
+  const response = await fetch(upstreamUrl, {
+    cache: "no-store",
+    headers: {
+      accept: "application/json",
+      "x-api-key": apiKey
+    }
+  });
+
+  if (!response.ok) {
+    throw new UpstreamSourceError(
+      `Upstream gagal dimuat (${response.status}).`,
+      502,
+      "UPSTREAM_REQUEST_FAILED"
+    );
+  }
+
+  const payload = (await response.json()) as unknown;
+  providerSeriesCache.set(upstreamUrl, {
+    expiresAt: now + providerSeriesCacheTtlMs,
+    payload
+  });
+
+  return payload;
+}
+
 function getUpstreamApiKey() {
   return (
     process.env.DRACINKU_API_KEY ||
@@ -235,7 +285,7 @@ function buildSeriesUrls({
   );
   liveUrl.searchParams.set("lang", language);
 
-  return [cacheUrl.toString(), liveUrl.toString()];
+  return [liveUrl.toString(), cacheUrl.toString()];
 }
 
 function normalizeBaseUrl(value?: string | null) {

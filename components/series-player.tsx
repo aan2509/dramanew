@@ -39,21 +39,52 @@ type BatchRefreshSourcePayload = {
   }>;
 };
 
+type FreshSourceOptions = {
+  force?: boolean;
+};
+
 type SubtitleCue = {
   end: number;
   start: number;
   text: string;
 };
 
+type SwipeStart = {
+  at: number;
+  pointerId: number;
+  x: number;
+  y: number;
+};
+
 type SubtitleBackdrop = "none" | "transparent" | "dark";
 type SubtitleSize = "small" | "medium" | "large";
 
 const playbackRates = [1, 1.25, 1.5, 2];
+const swipeAxisRatio = 1.25;
+const swipeMaxDurationMs = 900;
+const swipeMinDistance = 72;
 const sourcePrefetchLookAhead = 16;
 const sourcePrefetchDelayMs = 900;
 
-async function fetchEpisodeFreshSource(episodeId: string) {
+function isInteractiveTarget(target: EventTarget | null) {
+  return (
+    target instanceof Element &&
+    Boolean(target.closest("a,button,input,select,textarea,[role='button']"))
+  );
+}
+
+async function fetchEpisodeFreshSource(
+  episodeId: string,
+  options: FreshSourceOptions = {}
+) {
   const response = await fetch(`/api/episodes/${episodeId}/refresh-source`, {
+    body: JSON.stringify({
+      force: options.force === true,
+      persist: false
+    }),
+    headers: {
+      "Content-Type": "application/json"
+    },
     method: "POST"
   });
   const payload = (await response.json().catch(() => ({}))) as RefreshSourcePayload;
@@ -77,7 +108,7 @@ async function fetchEpisodeFreshSources(episodeIds: string[]) {
   if (!episodeIds.length) return new Map<string, string>();
 
   const response = await fetch("/api/episodes/refresh-sources", {
-    body: JSON.stringify({ episodeIds }),
+    body: JSON.stringify({ episodeIds, persist: false }),
     headers: {
       "Content-Type": "application/json"
     },
@@ -163,10 +194,13 @@ export function SeriesPlayer({
   );
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const controlsTimerRef = useRef<number | null>(null);
+  const suppressNextTapRef = useRef(false);
+  const swipeStartRef = useRef<SwipeStart | null>(null);
   const activeEpisodeIdRef = useRef<string | null>(
     episodes[initialIndex]?.id ?? null
   );
   const refreshAttemptedRef = useRef<Set<string>>(new Set());
+  const forceRefreshAttemptedRef = useRef<Set<string>>(new Set());
   const prefetchAttemptedRef = useRef<Set<string>>(new Set());
   const prefetchInFlightRef = useRef<Set<string>>(new Set());
   const [activeIndex, setActiveIndex] = useState(initialIndex);
@@ -199,17 +233,13 @@ export function SeriesPlayer({
     () => `EP.${active?.episode_number ?? active?.episode_index ?? "-"}`,
     [active]
   );
-  const activeSource = active
-    ? (sourceOverrides[active.id] ?? active.source_m3u8_url)
-    : null;
+  const activeSource = active ? (sourceOverrides[active.id] ?? null) : null;
   const sourceCandidates = useMemo(() => {
     if (!activeSource) return [];
     const decoded = getDecodedMediaSource(activeSource);
     return decoded ? [activeSource, decoded] : [activeSource];
   }, [activeSource]);
-  const nextSource = next
-    ? (sourceOverrides[next.id] ?? next.source_m3u8_url)
-    : null;
+  const nextSource = next ? (sourceOverrides[next.id] ?? null) : null;
   const transitionCoverStyle = series.cover_url
     ? { backgroundImage: `url("${series.cover_url.replace(/"/g, "%22")}")` }
     : undefined;
@@ -301,7 +331,7 @@ export function SeriesPlayer({
     [applySourceOverride]
   );
 
-  const requestFreshSource = useCallback(async () => {
+  const requestFreshSource = useCallback(async (forceFresh = false) => {
     if (!active?.id) {
       setError(true);
       setIsSwitchingEpisode(false);
@@ -309,20 +339,26 @@ export function SeriesPlayer({
     }
 
     const episodeId = active.id;
-    if (refreshAttemptedRef.current.has(episodeId)) {
+    if (
+      (!forceFresh && refreshAttemptedRef.current.has(episodeId)) ||
+      (forceFresh && forceRefreshAttemptedRef.current.has(episodeId))
+    ) {
       setError(true);
       setIsSwitchingEpisode(false);
       return;
     }
 
     refreshAttemptedRef.current.add(episodeId);
+    if (forceFresh) forceRefreshAttemptedRef.current.add(episodeId);
     setError(false);
     setRefreshError(null);
     setRefreshingSource(true);
     setIsSwitchingEpisode(true);
 
     try {
-      const freshSource = await fetchEpisodeFreshSource(episodeId);
+      const freshSource = await fetchEpisodeFreshSource(episodeId, {
+        force: forceFresh
+      });
       applySourceOverride(episodeId, freshSource);
 
       if (activeEpisodeIdRef.current === episodeId) {
@@ -336,7 +372,7 @@ export function SeriesPlayer({
       const fallbackMessage =
         loadError instanceof Error
           ? loadError.message
-          : "URL stream episode ini sudah tidak tersedia, dan upstream belum mengirim URL pengganti.";
+          : "Sumber upstream belum mengirim URL stream terbaru.";
       if (activeEpisodeIdRef.current === episodeId) {
         setRefreshError(fallbackMessage);
         setError(true);
@@ -357,7 +393,7 @@ export function SeriesPlayer({
       return;
     }
 
-    void requestFreshSource();
+    void requestFreshSource(true);
   }, [requestFreshSource, sourceCandidates.length, sourceIndex]);
 
   useEffect(() => {
@@ -395,7 +431,7 @@ export function SeriesPlayer({
     if (!video) return;
     if (!src) {
       queueMicrotask(() => {
-        void requestFreshSource();
+        void requestFreshSource(true);
       });
       return;
     }
@@ -604,6 +640,8 @@ export function SeriesPlayer({
   }
 
   function switchEpisode(index: number) {
+    if (index < 0 || index >= episodes.length || index === activeIndex) return;
+
     void prefetchFreshSources(
       episodes.slice(index + 1, index + 1 + sourcePrefetchLookAhead)
     );
@@ -617,12 +655,71 @@ export function SeriesPlayer({
   }
 
   function handleVideoTap() {
+    if (suppressNextTapRef.current) {
+      suppressNextTapRef.current = false;
+      return;
+    }
+
     if (!controlsVisible && isPlaying) {
       showControls();
       return;
     }
 
     togglePlay();
+  }
+
+  function handleSwipePointerDown(event: React.PointerEvent<HTMLElement>) {
+    if (event.pointerType === "mouse") return;
+    if (showEpisodes || showSubtitleSettings || isSwitchingEpisode) return;
+    if (isInteractiveTarget(event.target)) return;
+
+    swipeStartRef.current = {
+      at: Date.now(),
+      pointerId: event.pointerId,
+      x: event.clientX,
+      y: event.clientY
+    };
+  }
+
+  function handleSwipePointerUp(event: React.PointerEvent<HTMLElement>) {
+    const start = swipeStartRef.current;
+    swipeStartRef.current = null;
+
+    if (!start || start.pointerId !== event.pointerId) return;
+    if (showEpisodes || showSubtitleSettings || isSwitchingEpisode || refreshingSource) {
+      return;
+    }
+
+    const deltaX = event.clientX - start.x;
+    const deltaY = event.clientY - start.y;
+    const absX = Math.abs(deltaX);
+    const absY = Math.abs(deltaY);
+    const elapsed = Date.now() - start.at;
+
+    if (
+      absY < swipeMinDistance ||
+      absY < absX * swipeAxisRatio ||
+      elapsed > swipeMaxDurationMs
+    ) {
+      return;
+    }
+
+    const nextIndex = deltaY < 0 ? activeIndex + 1 : activeIndex - 1;
+    if (nextIndex < 0 || nextIndex >= episodes.length) {
+      showControls();
+      return;
+    }
+
+    event.preventDefault();
+    suppressNextTapRef.current = true;
+    window.setTimeout(() => {
+      suppressNextTapRef.current = false;
+    }, 350);
+    switchEpisode(nextIndex);
+  }
+
+  function handleSwipePointerCancel() {
+    swipeStartRef.current = null;
   }
 
   const overlayVisible =
@@ -636,9 +733,12 @@ export function SeriesPlayer({
   return (
     <section
       className="fixed inset-0 z-[60] bg-black text-white"
+      onPointerCancel={handleSwipePointerCancel}
+      onPointerDown={handleSwipePointerDown}
       onPointerMove={(event) => {
         if (event.pointerType === "mouse") showControls();
       }}
+      onPointerUp={handleSwipePointerUp}
     >
       <HlsPreloader src={nextSource} />
 
@@ -716,9 +816,9 @@ export function SeriesPlayer({
       {refreshingSource && !error ? (
         <div className="absolute inset-0 z-20 grid place-items-center bg-black/55 px-6 text-center">
           <div>
-            <p className="text-xl font-bold">Mengambil stream baru</p>
+            <p className="text-xl font-bold">Mengambil stream terbaru</p>
             <p className="mt-2 text-sm text-white/60">
-              URL lama kadaluarsa, mencoba mengambil sumber fresh dari upstream.
+              Menghubungi sumber upstream untuk URL episode terbaru.
             </p>
           </div>
         </div>

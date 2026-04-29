@@ -1,9 +1,6 @@
 import { unstable_noStore as noStore } from "next/cache";
 import { NextRequest, NextResponse } from "next/server";
-import {
-  createSupabaseClient,
-  createSupabaseWriteClient
-} from "@/lib/supabase";
+import { createSupabaseClient } from "@/lib/supabase";
 import {
   fetchFreshEpisodeSource,
   UpstreamSourceError
@@ -54,54 +51,62 @@ export async function GET(
     if (episodeError) throw episodeError;
 
     const episodeRow = episode as EpisodeRow;
+    let freshError: unknown = null;
+
+    try {
+      const series = await getSeriesFallback(supabase, episodeRow.series_id);
+      const platform = episodeRow.platform ?? series?.platform;
+      const providerSeriesId =
+        episodeRow.provider_series_id ?? series?.provider_series_id;
+      const providerBaseUrl = await getProviderBaseUrl(supabase, {
+        platform,
+        providerId: series?.provider_id
+      });
+      const freshSource = await fetchFreshEpisodeSource({
+        episodeId: episodeRow.id,
+        episodeIndex: episodeRow.episode_index,
+        episodeNumber: episodeRow.episode_number,
+        lang: episodeRow.lang ?? requestedLang,
+        platform,
+        providerBaseUrl,
+        providerSeriesId,
+        title: episodeRow.title
+      });
+
+      if (!freshSource.subtitleUrl) {
+        throw new UpstreamSourceError(
+          "Subtitle Indonesia tidak ditemukan dari upstream.",
+          404,
+          "UPSTREAM_SUBTITLE_NOT_FOUND"
+        );
+      }
+
+      const freshSubtitle = await tryFetchSubtitle(freshSource.subtitleUrl);
+      if (!freshSubtitle) {
+        throw new UpstreamSourceError(
+          "Subtitle Indonesia dari upstream belum bisa dimuat.",
+          404,
+          "UPSTREAM_SUBTITLE_UNAVAILABLE"
+        );
+      }
+
+      return subtitleResponse(freshSubtitle);
+    } catch (error) {
+      freshError = error;
+    }
+
     const existingSubtitle = await tryFetchSubtitle(episodeRow.subtitle_url);
     if (existingSubtitle) {
       return subtitleResponse(existingSubtitle);
     }
 
-    const series = await getSeriesFallback(supabase, episodeRow.series_id);
-    const platform = episodeRow.platform ?? series?.platform;
-    const providerSeriesId =
-      episodeRow.provider_series_id ?? series?.provider_series_id;
-    const providerBaseUrl = await getProviderBaseUrl(supabase, {
-      platform,
-      providerId: series?.provider_id
-    });
-    const freshSource = await fetchFreshEpisodeSource({
-      episodeId: episodeRow.id,
-      episodeIndex: episodeRow.episode_index,
-      episodeNumber: episodeRow.episode_number,
-      lang: episodeRow.lang ?? requestedLang,
-      platform,
-      providerBaseUrl,
-      providerSeriesId,
-      title: episodeRow.title
-    });
-
-    if (!freshSource.subtitleUrl) {
-      throw new UpstreamSourceError(
-        "Subtitle Indonesia tidak ditemukan dari upstream.",
-        404,
-        "UPSTREAM_SUBTITLE_NOT_FOUND"
-      );
-    }
-
-    const freshSubtitle = await tryFetchSubtitle(freshSource.subtitleUrl);
-    if (!freshSubtitle) {
-      throw new UpstreamSourceError(
-        "Subtitle Indonesia dari upstream belum bisa dimuat.",
-        404,
-        "UPSTREAM_SUBTITLE_UNAVAILABLE"
-      );
-    }
-
-    await persistFreshSubtitle({
-      episodeId: episodeRow.id,
-      subtitleLanguage: freshSource.subtitleLanguage || requestedLang,
-      subtitleUrl: freshSource.subtitleUrl
-    });
-
-    return subtitleResponse(freshSubtitle);
+    throw freshError instanceof Error
+      ? freshError
+      : new UpstreamSourceError(
+          "Subtitle Indonesia tidak ditemukan dari upstream.",
+          404,
+          "UPSTREAM_SUBTITLE_NOT_FOUND"
+        );
   } catch (error) {
     const status = error instanceof UpstreamSourceError ? error.status : 500;
     const code =
@@ -129,18 +134,42 @@ export async function GET(
 async function tryFetchSubtitle(url?: string | null) {
   if (!url) return null;
 
-  const response = await fetch(url, {
-    cache: "no-store",
-    headers: {
-      accept: "text/vtt,text/plain,*/*"
-    }
-  }).catch(() => null);
+  const candidates = [url, decodeDracinkuSubtitleUrl(url)].filter(
+    (candidate): candidate is string => Boolean(candidate)
+  );
 
-  if (!response?.ok) return null;
+  for (const candidate of candidates) {
+    const response = await fetch(candidate, {
+      cache: "no-store",
+      headers: {
+        accept: "text/vtt,text/plain,*/*"
+      }
+    }).catch(() => null);
 
-  const text = await response.text();
-  if (!looksLikeVtt(text)) return null;
-  return text;
+    if (!response?.ok) continue;
+
+    const text = await response.text();
+    if (looksLikeVtt(text)) return text;
+  }
+
+  return null;
+}
+
+function decodeDracinkuSubtitleUrl(value: string) {
+  try {
+    const url = new URL(value);
+    const marker = "/aliplay/subtitle/";
+    const markerIndex = url.pathname.indexOf(marker);
+    if (markerIndex === -1) return null;
+
+    const encoded = decodeURIComponent(
+      url.pathname.slice(markerIndex + marker.length)
+    );
+    const decoded = Buffer.from(encoded, "base64").toString("utf8");
+    return /^https?:\/\//i.test(decoded) ? decoded : null;
+  } catch {
+    return null;
+  }
 }
 
 function looksLikeVtt(text: string) {
@@ -155,25 +184,6 @@ function subtitleResponse(text: string) {
       "Content-Type": "text/vtt; charset=utf-8"
     }
   });
-}
-
-async function persistFreshSubtitle({
-  episodeId,
-  subtitleLanguage,
-  subtitleUrl
-}: {
-  episodeId: string;
-  subtitleLanguage: string;
-  subtitleUrl: string;
-}) {
-  const supabase = createSupabaseWriteClient();
-  await supabase
-    .from("episodes")
-    .update({
-      subtitle_language: subtitleLanguage,
-      subtitle_url: subtitleUrl
-    })
-    .eq("id", episodeId);
 }
 
 async function getSeriesFallback(
