@@ -45,6 +45,10 @@ type SubtitleCue = {
   text: string;
 };
 
+type SubtitleBackdrop = "none" | "transparent" | "dark";
+type SubtitleSize = "small" | "medium" | "large";
+
+const playbackRates = [1, 1.25, 1.5, 2];
 const sourcePrefetchLookAhead = 16;
 const sourcePrefetchDelayMs = 900;
 
@@ -180,8 +184,13 @@ export function SeriesPlayer({
   const [refreshError, setRefreshError] = useState<string | null>(null);
   const [userStartedPlayback, setUserStartedPlayback] = useState(false);
   const [subtitlesEnabled, setSubtitlesEnabled] = useState(true);
+  const [showSubtitleSettings, setShowSubtitleSettings] = useState(false);
+  const [subtitleBackdrop, setSubtitleBackdrop] =
+    useState<SubtitleBackdrop>("transparent");
   const [subtitleCues, setSubtitleCues] = useState<SubtitleCue[]>([]);
+  const [subtitleSize, setSubtitleSize] = useState<SubtitleSize>("medium");
   const [subtitleUnavailable, setSubtitleUnavailable] = useState<Record<string, boolean>>({});
+  const [playbackRate, setPlaybackRate] = useState(1);
 
   const active = episodes[activeIndex];
   const next = activeIndex < episodes.length - 1 ? episodes[activeIndex + 1] : null;
@@ -190,14 +199,14 @@ export function SeriesPlayer({
     () => `EP.${active?.episode_number ?? active?.episode_index ?? "-"}`,
     [active]
   );
+  const activeSource = active
+    ? (sourceOverrides[active.id] ?? active.source_m3u8_url)
+    : null;
   const sourceCandidates = useMemo(() => {
-    const primary = active
-      ? (sourceOverrides[active.id] ?? active.source_m3u8_url)
-      : null;
-    if (!primary) return [];
-    const decoded = getDecodedMediaSource(primary);
-    return decoded ? [primary, decoded] : [primary];
-  }, [active, sourceOverrides]);
+    if (!activeSource) return [];
+    const decoded = getDecodedMediaSource(activeSource);
+    return decoded ? [activeSource, decoded] : [activeSource];
+  }, [activeSource]);
   const nextSource = next
     ? (sourceOverrides[next.id] ?? next.source_m3u8_url)
     : null;
@@ -219,6 +228,18 @@ export function SeriesPlayer({
       .map((cue) => cue.text)
       .join("\n");
   }, [currentTime, subtitleCues, subtitlesEnabled]);
+  const subtitleSizeClass =
+    subtitleSize === "small"
+      ? "text-sm sm:text-lg"
+      : subtitleSize === "large"
+        ? "text-lg sm:text-2xl"
+        : "text-base sm:text-xl";
+  const subtitleBackdropClass =
+    subtitleBackdrop === "none"
+      ? "bg-transparent"
+      : subtitleBackdrop === "dark"
+        ? "bg-black/85"
+        : "bg-black/60";
 
   const showControls = useCallback(() => {
     setControlsVisible(true);
@@ -236,10 +257,12 @@ export function SeriesPlayer({
 
   const prefetchFreshSources = useCallback(
     async (items: Episode[]) => {
+      const activeEpisodeId = activeEpisodeIdRef.current;
       const targets = items
         .filter(
           (episode) =>
             episode.id &&
+            episode.id !== activeEpisodeId &&
             !prefetchAttemptedRef.current.has(episode.id) &&
             !prefetchInFlightRef.current.has(episode.id)
         )
@@ -256,6 +279,7 @@ export function SeriesPlayer({
       try {
         const refreshed = await fetchEpisodeFreshSources(episodeIds);
         for (const [episodeId, sourceUrl] of refreshed) {
+          if (episodeId === activeEpisodeIdRef.current) continue;
           applySourceOverride(episodeId, sourceUrl);
         }
 
@@ -346,7 +370,13 @@ export function SeriesPlayer({
       controlsTimerRef.current = null;
     }
 
-    if (controlsVisible && isPlaying && !showEpisodes && !error) {
+    if (
+      controlsVisible &&
+      isPlaying &&
+      !showEpisodes &&
+      !showSubtitleSettings &&
+      !error
+    ) {
       controlsTimerRef.current = window.setTimeout(() => {
         setControlsVisible(false);
       }, 2800);
@@ -357,7 +387,7 @@ export function SeriesPlayer({
         window.clearTimeout(controlsTimerRef.current);
       }
     };
-  }, [controlsVisible, error, isPlaying, showEpisodes]);
+  }, [controlsVisible, error, isPlaying, showEpisodes, showSubtitleSettings]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -379,7 +409,6 @@ export function SeriesPlayer({
       setCurrentTime(0);
       setDuration(0);
     });
-    video.muted = muted;
 
     const markReady = () => {
       if (video.readyState >= 2) setIsSwitchingEpisode(false);
@@ -459,11 +488,20 @@ export function SeriesPlayer({
   }, [
     active,
     handleSourceFailure,
-    muted,
     requestFreshSource,
     sourceCandidates,
     sourceIndex
   ]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (video) video.muted = muted;
+  }, [active?.id, muted]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (video) video.playbackRate = playbackRate;
+  }, [active?.id, playbackRate]);
 
   useEffect(() => {
     if (!active?.id) return;
@@ -558,10 +596,18 @@ export function SeriesPlayer({
     video.currentTime = (Number(value) / 100) * duration;
   }
 
+  function cyclePlaybackRate() {
+    const currentIndex = playbackRates.indexOf(playbackRate);
+    const nextRate = playbackRates[(currentIndex + 1) % playbackRates.length];
+    setPlaybackRate(nextRate);
+    showControls();
+  }
+
   function switchEpisode(index: number) {
     void prefetchFreshSources(
-      episodes.slice(index, index + sourcePrefetchLookAhead)
+      episodes.slice(index + 1, index + 1 + sourcePrefetchLookAhead)
     );
+    setShowSubtitleSettings(false);
     setSourceIndex(0);
     setRefreshError(null);
     setIsSwitchingEpisode(true);
@@ -580,7 +626,12 @@ export function SeriesPlayer({
   }
 
   const overlayVisible =
-    controlsVisible || !isPlaying || showEpisodes || error || refreshingSource;
+    controlsVisible ||
+    !isPlaying ||
+    showEpisodes ||
+    showSubtitleSettings ||
+    error ||
+    refreshingSource;
 
   return (
     <section
@@ -592,7 +643,7 @@ export function SeriesPlayer({
       <HlsPreloader src={nextSource} />
 
       <video
-        className="absolute inset-0 h-full w-full bg-black object-contain sm:object-cover"
+        className="absolute inset-0 h-full w-full bg-black object-cover"
         crossOrigin="anonymous"
         muted={muted}
         playsInline
@@ -623,7 +674,10 @@ export function SeriesPlayer({
 
       {activeSubtitleText ? (
         <div className="pointer-events-none absolute inset-x-3 bottom-28 z-10 flex justify-center px-8 sm:bottom-32">
-          <p className="max-w-3xl whitespace-pre-line rounded bg-black/70 px-3 py-2 text-center text-base font-semibold leading-snug text-white shadow-lg sm:text-xl">
+          <p
+            className={`max-w-3xl whitespace-pre-line rounded px-3 py-1.5 text-center font-semibold leading-snug text-white shadow-lg ${subtitleSizeClass} ${subtitleBackdropClass}`}
+            style={{ textShadow: "0 1px 3px rgba(0,0,0,.9)" }}
+          >
             {activeSubtitleText}
           </p>
         </div>
@@ -673,7 +727,7 @@ export function SeriesPlayer({
       <button
         aria-label={isPlaying ? "Pause" : "Play"}
         className={`absolute left-1/2 top-1/2 z-10 grid h-20 w-20 -translate-x-1/2 -translate-y-1/2 place-items-center rounded-full bg-black/45 text-white backdrop-blur-sm transition sm:h-24 sm:w-24 ${
-          isPlaying || isSwitchingEpisode || refreshingSource
+          isSwitchingEpisode || refreshingSource || !overlayVisible
             ? "pointer-events-none opacity-0"
             : "opacity-100"
         }`}
@@ -688,25 +742,17 @@ export function SeriesPlayer({
       </button>
 
       <aside
-        className={`absolute right-3 top-1/2 z-10 flex -translate-y-1/2 flex-col items-center gap-4 transition-opacity duration-300 sm:right-5 sm:gap-5 ${
+        className={`absolute right-3 top-1/2 z-10 flex -translate-y-1/2 flex-col items-center gap-3 transition-opacity duration-300 sm:right-5 ${
           overlayVisible ? "opacity-100" : "pointer-events-none opacity-0"
         }`}
       >
-        <ActionButton icon={<Bookmark className="h-6 w-6" />} label="Simpan" />
         <ActionButton
-          icon={<List className="h-6 w-6" />}
-          label="Episode"
-          onClick={() => {
-            showControls();
-            void prefetchFreshSources(
-              episodes.slice(
-                activeIndex + 1,
-                activeIndex + 1 + sourcePrefetchLookAhead
-              )
-            );
-            setShowEpisodes(true);
-          }}
+          active={!muted}
+          icon={muted ? <VolumeX className="h-6 w-6" /> : <Volume2 className="h-6 w-6" />}
+          label={muted ? "Mute" : "Suara"}
+          onClick={() => setAudioMuted(!muted)}
         />
+        <ActionButton icon={<Bookmark className="h-6 w-6" />} label="Simpan" />
         <ActionButton
           icon={<Share2 className="h-6 w-6" />}
           label="Bagikan"
@@ -720,13 +766,36 @@ export function SeriesPlayer({
           }}
         />
         <ActionButton
+          icon={<List className="h-6 w-6" />}
+          label="Episode"
+          onClick={() => {
+            showControls();
+            setShowSubtitleSettings(false);
+            void prefetchFreshSources(
+              episodes.slice(
+                activeIndex + 1,
+                activeIndex + 1 + sourcePrefetchLookAhead
+              )
+            );
+            setShowEpisodes(true);
+          }}
+        />
+        <ActionButton
           active={subtitlesEnabled && hasSubtitle}
           disabled={!hasSubtitle}
           icon={<Captions className="h-6 w-6" />}
           label={hasSubtitle ? (subtitlesEnabled ? "CC On" : "CC Off") : "No CC"}
           onClick={() => {
-            if (hasSubtitle) setSubtitlesEnabled((enabled) => !enabled);
+            if (!hasSubtitle) return;
+            showControls();
+            setShowEpisodes(false);
+            setShowSubtitleSettings(true);
           }}
+        />
+        <ActionButton
+          icon={<span className="text-sm font-black">{playbackRate}x</span>}
+          label="Speed"
+          onClick={cyclePlaybackRate}
         />
         <ActionLink
           href={`/series/${series.id}`}
@@ -736,43 +805,101 @@ export function SeriesPlayer({
       </aside>
 
       <div
-        className={`absolute inset-x-4 bottom-[max(1.5rem,env(safe-area-inset-bottom))] z-10 rounded-full bg-black/45 px-4 py-3 backdrop-blur-md transition-opacity duration-300 sm:inset-x-10 ${
+        className={`absolute inset-x-4 bottom-[max(1.25rem,env(safe-area-inset-bottom))] z-10 transition-opacity duration-300 sm:inset-x-10 ${
           overlayVisible ? "opacity-100" : "pointer-events-none opacity-0"
         }`}
       >
-        <div className="flex items-center gap-3">
-          <button aria-label="Play pause" onClick={togglePlay} type="button">
-            {isPlaying ? (
-              <Pause className="h-8 w-8 fill-current" strokeWidth={1.6} />
-            ) : (
-              <Play className="h-8 w-8 fill-current" strokeWidth={1.6} />
-            )}
-          </button>
-          <span className="w-14 text-center text-sm font-semibold">
-            {formatTime(currentTime)}
-          </span>
-          <input
-            aria-label="Progress"
-            className="h-2 min-w-0 flex-1 accent-white"
-            max="100"
-            min="0"
-            onChange={(event) => seek(event.target.value)}
-            type="range"
-            value={progress}
-          />
-          <span className="w-14 text-center text-sm font-semibold">
-            {formatTime(duration)}
-          </span>
-          <button
-            aria-label="Mute"
-            className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-white/10"
-            onClick={() => setAudioMuted(!muted)}
-            type="button"
-          >
-            {muted ? <VolumeX className="h-6 w-6" /> : <Volume2 className="h-6 w-6" />}
-          </button>
+        <input
+          aria-label="Progress"
+          className="h-1 w-full accent-[#6663ff]"
+          max="100"
+          min="0"
+          onChange={(event) => seek(event.target.value)}
+          type="range"
+          value={progress}
+        />
+        <div className="mt-2 flex items-center justify-between text-sm font-semibold text-white drop-shadow sm:text-base">
+          <span>{formatTime(currentTime)}</span>
+          <span>{formatTime(duration)}</span>
         </div>
       </div>
+
+      {showSubtitleSettings ? (
+        <div className="absolute inset-x-0 bottom-0 z-30 rounded-t-[1.75rem] bg-[#17181c]/95 px-5 pb-[max(1.5rem,env(safe-area-inset-bottom))] pt-4 text-white shadow-2xl backdrop-blur-xl sm:mx-auto sm:max-w-xl">
+          <div className="mx-auto mb-5 h-1.5 w-20 rounded-full bg-white/25" />
+          <div className="mb-6 flex items-center justify-between">
+            <h2 className="text-2xl font-black">Subtitle</h2>
+            <button
+              aria-label="Tutup subtitle"
+              className="grid h-10 w-10 place-items-center rounded-full bg-white/10"
+              onClick={() => setShowSubtitleSettings(false)}
+              type="button"
+            >
+              <X className="h-5 w-5" />
+            </button>
+          </div>
+
+          <div className="mb-7 flex items-center justify-between gap-4">
+            <span className="text-lg font-semibold">Tampilkan Subtitle</span>
+            <button
+              aria-pressed={subtitlesEnabled}
+              className={`relative h-12 w-20 rounded-full p-1 transition ${
+                subtitlesEnabled ? "bg-[#6663ff]" : "bg-white/15"
+              }`}
+              onClick={() => setSubtitlesEnabled((enabled) => !enabled)}
+              type="button"
+            >
+              <span
+                className={`block h-10 w-10 rounded-full bg-white transition ${
+                  subtitlesEnabled ? "translate-x-8" : "translate-x-0"
+                }`}
+              />
+            </button>
+          </div>
+
+          <p className="mb-3 text-sm font-bold uppercase tracking-wide text-white/45">
+            Ukuran Teks
+          </p>
+          <div className="mb-7 grid grid-cols-3 gap-3">
+            <SubtitleOption
+              active={subtitleSize === "small"}
+              label="Kecil"
+              onClick={() => setSubtitleSize("small")}
+            />
+            <SubtitleOption
+              active={subtitleSize === "medium"}
+              label="Sedang"
+              onClick={() => setSubtitleSize("medium")}
+            />
+            <SubtitleOption
+              active={subtitleSize === "large"}
+              label="Besar"
+              onClick={() => setSubtitleSize("large")}
+            />
+          </div>
+
+          <p className="mb-3 text-sm font-bold uppercase tracking-wide text-white/45">
+            Latar Belakang
+          </p>
+          <div className="grid grid-cols-3 gap-3">
+            <SubtitleOption
+              active={subtitleBackdrop === "none"}
+              label="Tanpa"
+              onClick={() => setSubtitleBackdrop("none")}
+            />
+            <SubtitleOption
+              active={subtitleBackdrop === "transparent"}
+              label="Transparan"
+              onClick={() => setSubtitleBackdrop("transparent")}
+            />
+            <SubtitleOption
+              active={subtitleBackdrop === "dark"}
+              label="Gelap"
+              onClick={() => setSubtitleBackdrop("dark")}
+            />
+          </div>
+        </div>
+      ) : null}
 
       {showEpisodes ? (
         <div className="absolute inset-x-0 bottom-0 z-30 max-h-[58dvh] overflow-hidden rounded-t-[2rem] border-t border-white/25 bg-[#2b2430]/95 px-5 pb-[max(1.5rem,env(safe-area-inset-bottom))] pt-4 backdrop-blur-xl">
@@ -829,7 +956,7 @@ function ActionButton({
 }) {
   return (
     <button
-      className={`flex flex-col items-center gap-1.5 text-white transition ${
+      className={`flex w-16 flex-col items-center gap-1.5 text-white transition ${
         disabled ? "opacity-40" : "opacity-100"
       }`}
       disabled={disabled}
@@ -837,13 +964,13 @@ function ActionButton({
       type="button"
     >
       <span
-        className={`grid h-12 w-12 place-items-center rounded-full backdrop-blur-sm sm:h-14 sm:w-14 ${
-          active ? "bg-[#d00064] text-white" : "bg-black/45"
+        className={`grid h-14 w-14 place-items-center rounded-2xl border border-white/10 shadow-lg backdrop-blur-md ${
+          active ? "bg-[#6663ff]/90 text-white" : "bg-white/15"
         }`}
       >
         {icon}
       </span>
-      <span className="text-xs font-bold">{label}</span>
+      <span className="max-w-full truncate text-xs font-bold drop-shadow">{label}</span>
     </button>
   );
 }
@@ -858,11 +985,33 @@ function ActionLink({
   label: string;
 }) {
   return (
-    <Link className="flex flex-col items-center gap-1.5 text-white" href={href}>
-      <span className="grid h-12 w-12 place-items-center rounded-full bg-black/45 backdrop-blur-sm sm:h-14 sm:w-14">
+    <Link className="flex w-16 flex-col items-center gap-1.5 text-white" href={href}>
+      <span className="grid h-14 w-14 place-items-center rounded-2xl border border-white/10 bg-white/15 shadow-lg backdrop-blur-md">
         {icon}
       </span>
-      <span className="text-xs font-bold">{label}</span>
+      <span className="max-w-full truncate text-xs font-bold drop-shadow">{label}</span>
     </Link>
+  );
+}
+
+function SubtitleOption({
+  active,
+  label,
+  onClick
+}: {
+  active: boolean;
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      className={`h-14 rounded-md text-base font-bold transition ${
+        active ? "bg-[#6663ff] text-white" : "bg-white/10 text-white/55"
+      }`}
+      onClick={onClick}
+      type="button"
+    >
+      {label}
+    </button>
   );
 }
